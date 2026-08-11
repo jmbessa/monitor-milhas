@@ -149,7 +149,8 @@ if len(_KEYWORDS_NORM) != len(KEYWORDS):
 SCORE_MINIMO = 14          # abaixo disso, ignora
 MILHEIRO_ALVO = 25.0       # R$ por 1.000 pontos Livelo — alerta URGENTE abaixo disso
 MILHEIRO_TETO = 30.0       # acima disso, nunca comprar
-BONUS_FORTE = 50           # % de bônus que dispensa o corte por score
+BONUS_FORTE = 50           # % de bônus que fura o corte por score (sinal forte)
+BONUS_URGENTE = 70         # % de bônus que marca o alerta como urgente
 
 STATE_FILE = Path(__file__).with_name(".monitor_state.json")
 ENV_FILE = Path(__file__).with_name(".env")
@@ -216,7 +217,7 @@ class Alerta:
     def urgente(self) -> bool:
         if self.milheiro is not None and self.milheiro <= MILHEIRO_ALVO:
             return True
-        if self.bonus_pct is not None and self.bonus_pct >= 70:
+        if self.bonus_pct is not None and self.bonus_pct >= BONUS_URGENTE:
             return True
         return self.score >= 30
 
@@ -235,12 +236,11 @@ class Alerta:
 
         if self.bonus_pct is not None:
             linhas.append(f"Bônus de transferência: {self.bonus_pct}%")
-            for prog, mult in (("Smiles", 1 + self.bonus_pct / 100),
-                               ("LATAM", 1 + self.bonus_pct / 100)):
-                efetivo = MILHEIRO_ALVO / mult
-                linhas.append(f"  ↳ a R$ {MILHEIRO_ALVO:.0f}/1k Livelo "
-                              f"= R$ {efetivo:.2f}/1k {prog}")
-                break  # mostra uma linha genérica, não duplica
+            base = self.milheiro if self.milheiro is not None else MILHEIRO_ALVO
+            mult = 1 + self.bonus_pct / 100
+            efetivo = base / mult
+            linhas.append(f"  ↳ a R$ {base:.2f}/1k Livelo "
+                          f"= R$ {efetivo:.2f}/1k transferido")
 
         linhas.append(f"\nScore: {self.score} ({', '.join(self.termos[:5])})")
         linhas.append(self.link)
@@ -257,14 +257,16 @@ _RE_MILHEIRO = re.compile(
     re.IGNORECASE,
 )
 _RE_MILHEIRO_ALT = re.compile(
-    r"milheiro\s+(?:a partir de|por|de)\s+R\$\s*(\d{1,3}(?:[.,]\d{2})?)",
+    r"milheiro\s+(?:a partir de|por|de|a)\s+R\$\s*(\d{1,3}(?:[.,]\d{2})?)",
     re.IGNORECASE,
 )
 _RE_BONUS = re.compile(r"(\d{2,3})\s*%\s*(?:de\s+)?bonus", re.IGNORECASE)
+_RE_BONUS_INV = re.compile(r"bonus\s+(?:de\s+)?(?:ate\s+)?(\d{2,3})\s*%", re.IGNORECASE)
 
 
 def _to_float(s: str) -> float:
-    return float(s.replace(".", "").replace(",", "."))
+    # A captura é no máximo \d{1,3}[.,]\d{2} — separador aqui é sempre decimal.
+    return float(s.replace(",", "."))
 
 
 def extrair_milheiro(texto: str) -> float | None:
@@ -277,8 +279,10 @@ def extrair_milheiro(texto: str) -> float | None:
 
 
 def extrair_bonus(texto: str) -> int | None:
-    """Maior percentual de bônus citado."""
-    valores = [int(m) for m in _RE_BONUS.findall(_normalizar(texto))]
+    """Maior percentual de bônus citado — número antes ou depois de "bônus"."""
+    baixo = _normalizar(texto)
+    valores = [int(m) for m in _RE_BONUS.findall(baixo)]
+    valores += [int(m) for m in _RE_BONUS_INV.findall(baixo)]
     valores = [v for v in valores if 10 <= v <= 200]
     return max(valores) if valores else None
 
@@ -343,7 +347,7 @@ def salvar_estado(vistos: dict[str, None]) -> None:
             delete=False,
         ) as saida:
             temporario = Path(saida.name)
-            json.dump(recortado, saida)
+            json.dump(recortado, saida, indent=0)
             saida.flush()
             os.fsync(saida.fileno())
         os.replace(temporario, STATE_FILE)

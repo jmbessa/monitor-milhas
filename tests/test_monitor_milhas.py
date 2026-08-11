@@ -68,7 +68,22 @@ def test_estado_sobrevive_ao_ciclo_preservando_os_mais_recentes(tmp_path, monkey
     vistos = mm.carregar_estado()
     mm.salvar_estado(vistos)
 
-    assert json.loads(arquivo.read_text(encoding="utf-8")) == ordem[-3:]
+    conteudo = arquivo.read_text(encoding="utf-8")
+    assert json.loads(conteudo) == ordem[-3:]
+    assert mm.carregar_estado() == dict.fromkeys(ordem[-3:])  # round-trip completo
+
+
+def test_salvar_estado_grava_um_id_por_linha(tmp_path, monkeypatch):
+    """~90KB numa linha só é diff ilegível e conflito impossível de resolver."""
+    arquivo = tmp_path / "estado.json"
+    monkeypatch.setattr(mm, "STATE_FILE", arquivo)
+
+    mm.salvar_estado(dict.fromkeys(["id-a", "id-b", "id-c"]))
+
+    conteudo = arquivo.read_text(encoding="utf-8")
+    assert "\n" in conteudo
+    linhas_com_id = [l for l in conteudo.splitlines() if "id-" in l]
+    assert len(linhas_com_id) == 3  # cada id na sua própria linha
 
 
 def test_carregar_estado_ausente_devolve_vazio(tmp_path, monkeypatch):
@@ -100,7 +115,7 @@ def test_salvar_estado_preserva_o_arquivo_quando_a_escrita_falha(tmp_path, monke
     arquivo.write_text(json.dumps(["id-antigo"]), encoding="utf-8")
     monkeypatch.setattr(mm, "STATE_FILE", arquivo)
 
-    def _falha_no_meio(dados, saida):
+    def _falha_no_meio(dados, saida, **kwargs):
         saida.write('["id-nov')       # metade do JSON, só no temporário
         raise OSError("sem espaço em disco")
 
@@ -135,10 +150,87 @@ def test_extrair_bonus_ainda_casa_com_acento():
     assert mm.extrair_bonus("promoção de 80% de bônus") == 80
 
 
+def test_extrair_bonus_com_bonus_antes_do_numero_e_ate():
+    assert mm.extrair_bonus("Livelo: bônus de até 110% na transferência") == 110
+
+
+def test_extrair_bonus_com_bonus_antes_do_numero():
+    assert mm.extrair_bonus("bônus de 80% para Smiles") == 80
+
+
 def test_normalizar_e_idempotente():
     uma_vez = mm._normalizar("Transferência Bonificada")
     assert mm._normalizar(uma_vez) == uma_vez
     assert uma_vez == "transferencia bonificada"
+
+
+# ---------------------------------------------------------------------------
+# EXTRAÇÃO — MILHEIRO
+# ---------------------------------------------------------------------------
+
+def test_extrair_milheiro_com_ponto_decimal():
+    """'27.50' não é milhar — a captura é no máximo \\d{1,3}[.,]\\d{2}."""
+    assert mm.extrair_milheiro("Compre pontos por R$ 27.50 o milheiro") == 27.5
+
+
+def test_extrair_milheiro_com_virgula_decimal_continua_igual():
+    assert mm.extrair_milheiro("Compre pontos por R$ 27,50 o milheiro") == 27.5
+
+
+def test_extrair_milheiro_ponto_como_milhar_e_filtrado_pela_sanidade():
+    """'1.000' truncado na captura vira 1.00 = R$ 1,00 — abaixo do piso de R$ 5."""
+    assert mm.extrair_milheiro("R$ 1.000 por 1.000 pontos") is None
+
+
+def test_extrair_milheiro_com_preposicao_a():
+    assert mm.extrair_milheiro("Clube Livelo com milheiro a R$ 24,90") == 24.9
+
+
+def test_extrair_milheiro_a_partir_de_continua_funcionando():
+    """'a partir de' precisa vencer o 'a' isolado na alternação do regex."""
+    assert mm.extrair_milheiro("milheiro a partir de R$ 28") == 28.0
+
+
+# ---------------------------------------------------------------------------
+# ALERTA — PREÇO EFETIVO NO BLOCO DE BÔNUS
+# ---------------------------------------------------------------------------
+
+def test_formatar_preco_efetivo_usa_o_milheiro_extraido():
+    """Com milheiro extraído, o efetivo tem que sair dele — não do alvo fixo."""
+    alerta = mm.Alerta(
+        fonte="Teste", titulo="T", link="https://x", score=10,
+        milheiro=27.5, bonus_pct=100,
+    )
+    assert "13.75" in alerta.formatar()
+
+
+def test_formatar_preco_efetivo_cai_no_alvo_sem_milheiro():
+    alerta = mm.Alerta(
+        fonte="Teste", titulo="T", link="https://x", score=10,
+        milheiro=None, bonus_pct=100,
+    )
+    assert "12.50" in alerta.formatar()
+
+
+# ---------------------------------------------------------------------------
+# ALERTA — URGÊNCIA POR BÔNUS (BONUS_URGENTE)
+# ---------------------------------------------------------------------------
+
+def test_urgente_no_limiar_de_bonus_urgente():
+    assert mm.BONUS_URGENTE == 70
+    alerta = mm.Alerta(
+        fonte="Teste", titulo="T", link="https://x", score=0,
+        milheiro=None, bonus_pct=70,
+    )
+    assert alerta.urgente is True
+
+
+def test_urgente_abaixo_do_limiar_de_bonus_urgente_nao_urgentiza():
+    alerta = mm.Alerta(
+        fonte="Teste", titulo="T", link="https://x", score=0,
+        milheiro=None, bonus_pct=69,
+    )
+    assert alerta.urgente is False
 
 
 # ---------------------------------------------------------------------------
