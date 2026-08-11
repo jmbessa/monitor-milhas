@@ -1,5 +1,5 @@
 .env
-.monitor_state.json
 monitor.log
 __pycache__/
+.pytest_cache/
 .superpowers/
