@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,21 @@ KEYWORDS: dict[str, int] = {
     "streaming": -4,
     "celular": -4,
 }
+
+
+def _normalizar(s: str) -> str:
+    """Minúsculas e sem acento — protege contra variação editorial ("bonus")."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+# KEYWORDS fica legível com acento no fonte; a comparação usa esta versão.
+_KEYWORDS_NORM: dict[str, int] = {_normalizar(k): v for k, v in KEYWORDS.items()}
+
+if len(_KEYWORDS_NORM) != len(KEYWORDS):
+    print("[warn] chaves de KEYWORDS colidem ao perder o acento", file=sys.stderr)
 
 SCORE_MINIMO = 14          # abaixo disso, ignora
 MILHEIRO_ALVO = 25.0       # R$ por 1.000 pontos Livelo — alerta URGENTE abaixo disso
@@ -202,7 +218,7 @@ _RE_MILHEIRO_ALT = re.compile(
     r"milheiro\s+(?:a partir de|por|de)\s+R\$\s*(\d{1,3}(?:[.,]\d{2})?)",
     re.IGNORECASE,
 )
-_RE_BONUS = re.compile(r"(\d{2,3})\s*%\s*(?:de\s+)?bônus", re.IGNORECASE)
+_RE_BONUS = re.compile(r"(\d{2,3})\s*%\s*(?:de\s+)?bonus", re.IGNORECASE)
 
 
 def _to_float(s: str) -> float:
@@ -211,6 +227,7 @@ def _to_float(s: str) -> float:
 
 def extrair_milheiro(texto: str) -> float | None:
     """Menor milheiro citado no texto — promoções costumam citar o melhor caso."""
+    texto = _normalizar(texto)
     valores = [_to_float(m) for m in _RE_MILHEIRO.findall(texto)]
     valores += [_to_float(m) for m in _RE_MILHEIRO_ALT.findall(texto)]
     valores = [v for v in valores if 5.0 <= v <= 100.0]  # sanidade
@@ -219,15 +236,15 @@ def extrair_milheiro(texto: str) -> float | None:
 
 def extrair_bonus(texto: str) -> int | None:
     """Maior percentual de bônus citado."""
-    valores = [int(m) for m in _RE_BONUS.findall(texto)]
+    valores = [int(m) for m in _RE_BONUS.findall(_normalizar(texto))]
     valores = [v for v in valores if 10 <= v <= 200]
     return max(valores) if valores else None
 
 
 def pontuar(texto: str) -> tuple[int, list[str]]:
-    baixo = texto.lower()
+    baixo = _normalizar(texto)
     score, achados = 0, []
-    for termo, peso in KEYWORDS.items():
+    for termo, peso in _KEYWORDS_NORM.items():
         if termo in baixo:
             score += peso
             if peso > 0:

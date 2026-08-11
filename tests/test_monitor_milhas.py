@@ -34,3 +34,33 @@ def test_carregar_estado_ilegivel_recomeca(tmp_path, monkeypatch):
     arquivo.write_text("{lixo,", encoding="utf-8")
     monkeypatch.setattr(mm, "STATE_FILE", arquivo)
     assert mm.carregar_estado() == {}
+
+
+# ---------------------------------------------------------------------------
+# NORMALIZAÇÃO DE ACENTO
+# ---------------------------------------------------------------------------
+
+def test_pontuar_casa_termo_escrito_sem_acento():
+    score, termos = mm.pontuar("Livelo com bonus na transferencia")
+    assert "bonus na transferencia" in termos
+    assert score >= 10
+
+
+def test_pontuar_indiferente_ao_acento():
+    com_acento, _ = mm.pontuar("bônus na transferência")
+    sem_acento, _ = mm.pontuar("bonus na transferencia")
+    assert com_acento == sem_acento
+
+
+def test_extrair_bonus_casa_sem_acento():
+    assert mm.extrair_bonus("promocao de 80% de bonus") == 80
+
+
+def test_extrair_bonus_ainda_casa_com_acento():
+    assert mm.extrair_bonus("promoção de 80% de bônus") == 80
+
+
+def test_normalizar_e_idempotente():
+    uma_vez = mm._normalizar("Transferência Bonificada")
+    assert mm._normalizar(uma_vez) == uma_vez
+    assert uma_vez == "transferencia bonificada"
