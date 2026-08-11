@@ -18,6 +18,9 @@ concurrency:
 jobs:
   varrer:
     runs-on: ubuntu-latest
+    # O padrão são 6 horas: um blog que aceita a conexão e nunca responde
+    # seguraria a fila por 12 execuções, tudo "in progress", sem email de falha.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -35,12 +38,28 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor_milhas.py
 
+      # Só roda se a varredura passou, e é isso que dá o retry: estado commitado
+      # depois de uma falha marcaria como vistos posts que nunca viraram alerta.
+      # Este passo não pode ganhar condição nenhuma que o faça rodar mesmo assim.
       - name: Persistir o estado
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .monitor_state.json
-          if ! git diff --staged --quiet; then
-            git commit -m "estado: $(date -u '+%Y-%m-%d %H:%M UTC')"
-            git push
+          if git diff --staged --quiet; then
+            echo "estado inalterado, nada a commitar"
+            exit 0
           fi
+          git commit -m "estado: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          # Um commit seu no meio do caminho rejeitaria o push por
+          # non-fast-forward, DEPOIS de os alertas terem saído: o estado seria
+          # descartado e a execução seguinte reenviaria tudo. Rebase e insiste.
+          for tentativa in 1 2 3; do
+            git pull --rebase origin "$GITHUB_REF_NAME" || exit 1
+            if git push; then
+              exit 0
+            fi
+            echo "push rejeitado na tentativa $tentativa; tentando de novo"
+            sleep 5
+          done
+          exit 1
