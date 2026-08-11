@@ -2,3 +2,4 @@
 .monitor_state.json
 monitor.log
 __pycache__/
+.superpowers/

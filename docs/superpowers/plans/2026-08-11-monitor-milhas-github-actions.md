@@ -65,7 +65,6 @@ Arquivo `tests/test_monitor_milhas.py`:
 """Testes de monitor_milhas.py — funções puras e o filtro de varredura."""
 
 import json
-import types
 
 import monitor_milhas as mm
 
@@ -349,7 +348,16 @@ Score é heurística; milheiro extraído é fato. Hoje o corte por `SCORE_MINIMO
 
 - [ ] **Step 1: Escrever os testes que falham**
 
-Acrescentar ao fim de `tests/test_monitor_milhas.py`:
+Os dois últimos testes montam um feed falso, então acrescente `import types` ao bloco de imports no topo de `tests/test_monitor_milhas.py`:
+
+```python
+import json
+import types
+
+import monitor_milhas as mm
+```
+
+E acrescente ao fim do arquivo:
 
 ```python
 # ---------------------------------------------------------------------------
@@ -527,14 +535,17 @@ O Windows converte para CRLF e o runner do Actions escreve LF. Sem isso, cada ex
 
 - [ ] **Step 3: Reescrever o `.gitignore`**
 
-Sai o `.monitor_state.json` (agora é versionado de propósito), entra o cache do pytest:
+Sai o `.monitor_state.json` (agora é versionado de propósito), entram o cache do pytest e o diretório de trabalho do processo de implementação:
 
 ```
 .env
 monitor.log
 __pycache__/
 .pytest_cache/
+.superpowers/
 ```
+
+`.superpowers/` guarda o registro de progresso e os pacotes de revisão desta implementação — é rascunho local, nunca deve ser versionado.
 
 - [ ] **Step 4: Semear o estado sem enviar nada ao Telegram**
 
