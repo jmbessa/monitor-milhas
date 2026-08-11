@@ -239,17 +239,21 @@ def pontuar(texto: str) -> tuple[int, list[str]]:
 # ESTADO
 # ----------------------------------------------------------------------------
 
-def carregar_estado() -> set[str]:
+def carregar_estado() -> dict[str, None]:
+    """IDs já vistos, como conjunto ordenado — dict preserva ordem de inserção."""
     if not STATE_FILE.exists():
-        return set()
+        return {}
     try:
-        return set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+        dados = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         print(f"[warn] estado ilegível ({e}), recomeçando", file=sys.stderr)
-        return set()
+        return {}
+    return dict.fromkeys(dados)
 
 
-def salvar_estado(vistos: set[str]) -> None:
+def salvar_estado(vistos: dict[str, None]) -> None:
+    # Corta pelo começo: descarta os mais antigos e preserva os recentes.
+    # Só funciona porque `vistos` é dict — com set a ordem seria arbitrária.
     recortado = list(vistos)[-MAX_STATE_ENTRIES:]
     try:
         STATE_FILE.write_text(json.dumps(recortado), encoding="utf-8")
@@ -307,7 +311,7 @@ def varrer() -> list[Alerta]:
             uid = entrada.get("id") or entrada.get("link")
             if not uid or uid in vistos:
                 continue
-            vistos.add(uid)
+            vistos[uid] = None
 
             titulo = entrada.get("title", "").strip()
             resumo = re.sub(r"<[^>]+>", " ", entrada.get("summary", ""))
