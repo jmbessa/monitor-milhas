@@ -192,7 +192,7 @@ def test_varrer_alerta_post_de_score_baixo_que_anuncia_milheiro(tmp_path, monkey
     feed = types.SimpleNamespace(entries=[entrada], bozo=False)
     monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
 
-    alertas = mm.varrer()
+    alertas, _ = mm.varrer()
 
     assert len(alertas) == 1
     assert alertas[0].milheiro == 27.0
@@ -213,7 +213,8 @@ def test_varrer_ignora_post_irrelevante(tmp_path, monkeypatch):
     feed = types.SimpleNamespace(entries=[entrada], bozo=False)
     monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
 
-    assert mm.varrer() == []
+    alertas, _ = mm.varrer()
+    assert alertas == []
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +230,8 @@ def test_varrer_descarta_score_negativo_ainda_que_o_preco_seja_legivel(
     assert mm.pontuar(titulo)[0] < 0               # e o dicionário falou contra
 
     _stub_feed(monkeypatch, [_entrada("post-neg", titulo)])
-    assert mm.varrer() == []
+    alertas, _ = mm.varrer()
+    assert alertas == []
 
 
 def test_varrer_ainda_alerta_score_positivo_com_o_mesmo_preco(
@@ -239,7 +241,7 @@ def test_varrer_ainda_alerta_score_positivo_com_o_mesmo_preco(
     titulo = "Oferta relâmpago: milheiro por R$ 27"
     _stub_feed(monkeypatch, [_entrada("post-pos", titulo)])
 
-    alertas = mm.varrer()
+    alertas, _ = mm.varrer()
 
     assert len(alertas) == 1
     assert alertas[0].score == 8                   # abaixo de SCORE_MINIMO
@@ -273,6 +275,58 @@ def test_main_devolve_zero_quando_o_envio_da_certo(main_isolado, monkeypatch):
 
     assert mm.main() == 0
     assert len(enviados) == 1
+
+
+# ---------------------------------------------------------------------------
+# C1 (residual) — ESTADO SÓ SE SALVA DEPOIS DO ENVIO
+# ---------------------------------------------------------------------------
+
+def test_main_falha_de_envio_nao_toca_no_arquivo_de_estado(main_isolado, monkeypatch):
+    """Mutação: se salvar_estado voltar para dentro de varrer(), isto falha.
+
+    Em cron local (sem o "descarte" do runner efêmero do Actions) uma escrita
+    antes do envio perderia o alerta pra sempre: o id já teria sido marcado
+    como visto quando o Telegram falhou.
+    """
+    arquivo = main_isolado / "estado.json"
+    conteudo_anterior = json.dumps(["id-antigo"])
+    arquivo.write_text(conteudo_anterior, encoding="utf-8")
+
+    _stub_feed(monkeypatch, [_entrada()])
+    monkeypatch.setattr(mm, "enviar_telegram", lambda mensagem: False)
+
+    codigo = mm.main()
+
+    assert codigo == mm.SAIDA_ENVIO
+    assert arquivo.read_bytes() == conteudo_anterior.encode("utf-8")
+
+
+def test_main_envio_bem_sucedido_salva_estado_com_o_novo_id(main_isolado, monkeypatch):
+    arquivo = main_isolado / "estado.json"
+    _stub_feed(monkeypatch, [_entrada("post-novo")])
+    monkeypatch.setattr(mm, "enviar_telegram", lambda mensagem: True)
+
+    codigo = mm.main()
+
+    assert codigo == mm.SAIDA_OK
+    assert json.loads(arquivo.read_text(encoding="utf-8")) == ["post-novo"]
+
+
+def test_main_sem_alertas_ainda_assim_salva_estado(main_isolado, monkeypatch):
+    """Post novo e irrelevante marca visto mesmo sem nenhum alerta enviado."""
+    arquivo = main_isolado / "estado.json"
+    entrada_irrelevante = {
+        "id": "post-irrelevante",
+        "title": "As 10 melhores praias do Nordeste",
+        "summary": "",
+        "link": "https://exemplo.com/post-irrelevante",
+    }
+    _stub_feed(monkeypatch, [entrada_irrelevante])
+
+    codigo = mm.main()
+
+    assert codigo == mm.SAIDA_OK
+    assert json.loads(arquivo.read_text(encoding="utf-8")) == ["post-irrelevante"]
 
 
 def test_main_falha_sem_credenciais_e_nem_chega_a_varrer(main_isolado, monkeypatch):
@@ -371,7 +425,7 @@ def test_varrer_pula_entrada_malformada_e_segue(varredura_isolada, monkeypatch, 
     """M5: uma entrada ruim ficaria dias no feed, quebrando toda execução."""
     _stub_feed(monkeypatch, [_EntradaTorta(), _entrada("post-bom")])
 
-    alertas = mm.varrer()
+    alertas, _ = mm.varrer()
 
     assert len(alertas) == 1
     assert alertas[0].link.endswith("post-bom")

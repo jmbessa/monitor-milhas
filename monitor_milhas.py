@@ -421,7 +421,7 @@ def _processar_entrada(fonte: str, entrada: dict, vistos: dict[str, None]) -> Al
     )
 
 
-def varrer() -> list[Alerta]:
+def varrer() -> tuple[list[Alerta], dict[str, None]]:
     vistos = carregar_estado()
     novos: list[Alerta] = []
     total_entradas = 0
@@ -458,10 +458,9 @@ def varrer() -> list[Alerta]:
     if total_entradas == 0:
         raise FeedsIndisponiveis("nenhum dos feeds devolveu entradas")
 
-    salvar_estado(vistos)
     # urgentes primeiro, depois por score
     novos.sort(key=lambda a: (a.urgente, a.score), reverse=True)
-    return novos
+    return novos, vistos
 
 
 def main() -> int:
@@ -478,7 +477,7 @@ def main() -> int:
         return SAIDA_CREDENCIAIS
 
     try:
-        alertas = varrer()
+        alertas, vistos = varrer()
     except FeedsIndisponiveis as e:
         print(f"[erro] {e}", file=sys.stderr)
         return SAIDA_FEEDS
@@ -487,6 +486,9 @@ def main() -> int:
         return SAIDA_ESTADO
 
     if not alertas:
+        # Sem alerta ainda há posts novos e não-alarmantes para marcar como
+        # vistos — sem isto eles voltariam a ser avaliados na próxima volta.
+        salvar_estado(vistos)
         print(f"[{agora:%d/%m %H:%M}] nada novo")
         return SAIDA_OK
 
@@ -498,11 +500,17 @@ def main() -> int:
         time.sleep(0.5)  # rate limit do Telegram
 
     if falhas:
-        # Sai vermelho de propósito: o passo que commita o estado não roda, o
-        # estado desta execução é descartado e a próxima reencontra os posts.
+        # Sai vermelho de propósito e NÃO salva o estado: os posts que
+        # falharam continuam "não vistos" e a próxima execução reencontra o
+        # lote inteiro e tenta de novo. Duplicar alerta é ruído tolerável;
+        # perdê-lo em silêncio não é — vale tanto na nuvem (o passo de
+        # persistência simplesmente não roda) quanto num cron local, onde
+        # antes desta correção o arquivo já tinha sido reescrito em disco.
         print(f"[erro] {falhas} de {len(alertas)} alerta(s) não entregues",
               file=sys.stderr)
         return SAIDA_ENVIO
+
+    salvar_estado(vistos)
     return SAIDA_OK
 
 

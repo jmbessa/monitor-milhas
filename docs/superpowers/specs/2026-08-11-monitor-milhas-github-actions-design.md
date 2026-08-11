@@ -167,10 +167,12 @@ dos quais 19 teriam virado alerta — a enxurrada que ela existia para evitar er
 real. Mas a correção do C1 (abaixo) passou a checar credenciais *antes* de
 varrer, para que um secret com nome errado não imprima alertas no log público.
 Isso torna `main()` inutilizável para semear. Se for preciso semear de novo,
-chame `varrer()` diretamente:
+chame `varrer()` diretamente — desde o C1 residual ela só devolve o par
+`(alertas, vistos)` e não salva mais nada sozinha, então o `salvar_estado` sai
+explícito no comando:
 
 ```powershell
-python -c "import monitor_milhas as m; [print(a.formatar()) for a in m.varrer()]"
+python -c "import monitor_milhas as m; alertas, vistos = m.varrer(); [print(a.formatar()) for a in alertas]; m.salvar_estado(vistos)"
 ```
 
 ## Endurecimento para operação sem supervisão
@@ -182,7 +184,7 @@ produziam run verde e silêncio total, indistinguíveis de uma semana fraca.
 
 | Falha | Antes | Agora |
 |---|---|---|
-| Telegram fora, ou secret com nome errado | alertas perdidos, estado commitado marcando os posts como vistos, run verde. Com secret errado, o alerta ainda era impresso no log **público** | credenciais checadas antes de varrer (saída 1); falha de envio devolve saída 2. Passo de persistência não roda, próximo run tenta de novo |
+| Telegram fora, ou secret com nome errado | alertas perdidos, estado commitado marcando os posts como vistos, run verde. Com secret errado, o alerta ainda era impresso no log **público** | credenciais checadas antes de varrer (saída 1); falha de envio devolve saída 2. `salvar_estado` só roda em `main()` depois do loop de envio, e só se nenhum envio falhou — na nuvem o passo de persistência também não roda, mas agora a garantia vive no próprio script, não só no workflow. É o que torna o modo cron local do cabeçalho do módulo seguro: antes desta correção, `varrer()` salvava o estado antes de qualquer envio, e uma falha ali perdia o alerta pra sempre num cron local (sem runner efêmero para descartar) |
 | Todos os feeds bloqueados pelo CDN | `"nada novo"` a cada 30 min, para sempre, verde | zero entradas em todos os feeds → saída 3 |
 | Host que aceita conexão e nunca responde | job preso até o teto de 6h, enfileirando os seguintes | `socket.setdefaulttimeout(20)` + `timeout-minutes: 10` |
 | Escrita do estado interrompida no meio | arquivo truncado lido como vazio → ~25 alertas de uma vez | escrita atômica (temp + `os.replace`); estado corrompido aborta com saída 4 em vez de assumir vazio |
