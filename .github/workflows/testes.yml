@@ -1,0 +1,36 @@
+name: testes
+
+# Separado do monitor de propósito: aquele job roda 48×/dia e não deve carregar
+# a suíte junto. Este só roda quando o código muda.
+on:
+  push:
+  workflow_dispatch:
+
+# Não commita nada e não usa secret nenhum.
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 é a versão que o monitor usa no CI; 3.14, a da máquina do dono.
+        python-version: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Rodar a suíte
+        run: python -m pytest -q
