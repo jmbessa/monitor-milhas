@@ -127,17 +127,28 @@ R$ 27" é descartado se o vocabulário não bater. Inverter a ordem: extrair
 primeiro, e deixar o sinal duro furar o corte.
 
 ```python
-mi = extrair_milheiro(texto)
-bo = extrair_bonus(texto)
-forte = (mi is not None and mi <= MILHEIRO_TETO) or (bo is not None and bo >= 50)
-if score < SCORE_MINIMO and not forte:
+milheiro = extrair_milheiro(texto)
+bonus_pct = extrair_bonus(texto)
+if score < SCORE_MINIMO and not (score >= 0 and sinal_forte(milheiro, bonus_pct)):
     continue
 ```
 
-Tradeoff aceito: o sinal forte é absoluto, então um post majoritariamente ruído
-(score negativo) que cite um milheiro dentro do teto vai alertar. É raro, e é
-exatamente o caso que o bypass existe para cobrir — dicionário incompleto. O
-alerta mostra o score, então a origem fica óbvia na mensagem.
+**Revisado durante a implementação.** O desenho original tornava o sinal forte
+absoluto, aceitando que um post majoritariamente ruído também alertasse — o
+raciocínio era que isso cobria um dicionário incompleto. A revisão final executou
+o filtro contra manchetes reais e mostrou que o custo é maior do que parecia:
+
+| Manchete | Score | Comportamento com o bypass absoluto |
+|---|---|---|
+| `"Cartão Itaú: 100% de bônus de boas-vindas no seguro viagem"` | 3 | 🔴 URGENTE — mas `boas-vindas` e `seguro` existem para matar exatamente isso |
+| `"Esfera: pontos a R$ 27 por 1.000 no seguro celular"` | −11 | alerta exibindo `Score: -11 ()` |
+| `"Vendemos seu milheiro por R$ 22,00"` | 8 | 🔴 URGENTE com veredito **COMPRAR** — post de venda lido como oportunidade de compra |
+
+A diferença que o desenho original não separou: dicionário **incompleto** (score
+perto de zero, nada opinou) versus dicionário que **falou contra** (score
+negativo). O bypass existe para o primeiro caso. Daí a condição `score >= 0`: o
+sinal forte continua furando o corte de 0 a 13, e para de anular os pesos
+negativos quando eles foram acionados de propósito.
 
 Efeito colateral: um `Alerta` pode agora ter score abaixo de `SCORE_MINIMO`.
 Nada quebra — `urgente` já decide por milheiro e bônus antes de olhar o score.
@@ -150,6 +161,41 @@ dry-run com `TELEGRAM_BOT_TOKEN=""` e `TELEGRAM_CHAT_ID=""`: variável de
 ambiente tem precedência sobre o `.env`, e `enviar_telegram()` cai no ramo
 dry-run com valor vazio, imprimindo em vez de enviar. O estado é populado, e
 commitamos o arquivo já preenchido. A nuvem começa em silêncio.
+
+**Executado, e o caminho mudou depois.** A semeadura rodou e capturou 70 IDs,
+dos quais 19 teriam virado alerta — a enxurrada que ela existia para evitar era
+real. Mas a correção do C1 (abaixo) passou a checar credenciais *antes* de
+varrer, para que um secret com nome errado não imprima alertas no log público.
+Isso torna `main()` inutilizável para semear. Se for preciso semear de novo,
+chame `varrer()` diretamente:
+
+```powershell
+python -c "import monitor_milhas as m; [print(a.formatar()) for a in m.varrer()]"
+```
+
+## Endurecimento para operação sem supervisão
+
+Acrescentado depois da revisão final. O desenho original tratava a nuvem como
+"o mesmo script, em outro lugar". Rodando 48×/dia sem ninguém olhando, o que
+importa não é só funcionar — é **falhar alto**. Os três piores modos de falha
+produziam run verde e silêncio total, indistinguíveis de uma semana fraca.
+
+| Falha | Antes | Agora |
+|---|---|---|
+| Telegram fora, ou secret com nome errado | alertas perdidos, estado commitado marcando os posts como vistos, run verde. Com secret errado, o alerta ainda era impresso no log **público** | credenciais checadas antes de varrer (saída 1); falha de envio devolve saída 2. Passo de persistência não roda, próximo run tenta de novo |
+| Todos os feeds bloqueados pelo CDN | `"nada novo"` a cada 30 min, para sempre, verde | zero entradas em todos os feeds → saída 3 |
+| Host que aceita conexão e nunca responde | job preso até o teto de 6h, enfileirando os seguintes | `socket.setdefaulttimeout(20)` + `timeout-minutes: 10` |
+| Escrita do estado interrompida no meio | arquivo truncado lido como vazio → ~25 alertas de uma vez | escrita atômica (temp + `os.replace`); estado corrompido aborta com saída 4 em vez de assumir vazio |
+| Você commita um ajuste de pesos enquanto um run está no ar | push rejeitado, alertas já enviados e estado descartado → reenvio no run seguinte | `git pull --rebase` com até 3 tentativas |
+| Uma entrada malformada no feed | exceção derruba a varredura inteira | entrada pulada com aviso, varredura continua |
+
+Duas correções de higiene junto: a exceção do `requests` deixou de ser impressa
+(o texto dela embute o token na URL) e a saída passa a ser reconfigurada para
+UTF-8 (os emojis do alerta quebravam com `charmap` no Windows sob redirecionamento).
+
+Os testes rodam num workflow separado, `testes.yml`, em `push`, na matriz 3.12 e
+3.14. Fora do `monitor.yml` de propósito: aquele job roda 48 vezes por dia e não
+deve carregar a suíte junto.
 
 ## Segurança
 
