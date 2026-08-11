@@ -128,6 +128,7 @@ if len(_KEYWORDS_NORM) != len(KEYWORDS):
 SCORE_MINIMO = 14          # abaixo disso, ignora
 MILHEIRO_ALVO = 25.0       # R$ por 1.000 pontos Livelo — alerta URGENTE abaixo disso
 MILHEIRO_TETO = 30.0       # acima disso, nunca comprar
+BONUS_FORTE = 50           # % de bônus que dispensa o corte por score
 
 STATE_FILE = Path(__file__).with_name(".monitor_state.json")
 ENV_FILE = Path(__file__).with_name(".env")
@@ -241,6 +242,13 @@ def extrair_bonus(texto: str) -> int | None:
     return max(valores) if valores else None
 
 
+def sinal_forte(milheiro: float | None, bonus_pct: int | None) -> bool:
+    """Milheiro ou bônus extraído é fato; o score é palpite. Fato tem precedência."""
+    if milheiro is not None and milheiro <= MILHEIRO_TETO:
+        return True
+    return bonus_pct is not None and bonus_pct >= BONUS_FORTE
+
+
 def pontuar(texto: str) -> tuple[int, list[str]]:
     baixo = _normalizar(texto)
     score, achados = 0, []
@@ -335,7 +343,12 @@ def varrer() -> list[Alerta]:
             texto = f"{titulo}\n{resumo}"
 
             score, termos = pontuar(texto)
-            if score < SCORE_MINIMO:
+            milheiro = extrair_milheiro(texto)
+            bonus_pct = extrair_bonus(texto)
+
+            # Sinal duro fura o corte: o dicionário pode estar incompleto,
+            # mas um milheiro anunciado no título não deixa dúvida.
+            if score < SCORE_MINIMO and not sinal_forte(milheiro, bonus_pct):
                 continue
 
             novos.append(Alerta(
@@ -343,8 +356,8 @@ def varrer() -> list[Alerta]:
                 titulo=titulo,
                 link=entrada.get("link", ""),
                 score=score,
-                milheiro=extrair_milheiro(texto),
-                bonus_pct=extrair_bonus(texto),
+                milheiro=milheiro,
+                bonus_pct=bonus_pct,
                 termos=termos,
             ))
 

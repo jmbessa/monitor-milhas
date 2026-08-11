@@ -1,6 +1,7 @@
 """Testes de monitor_milhas.py — funções puras e o filtro de varredura."""
 
 import json
+import types
 
 import monitor_milhas as mm
 
@@ -64,3 +65,66 @@ def test_normalizar_e_idempotente():
     uma_vez = mm._normalizar("Transferência Bonificada")
     assert mm._normalizar(uma_vez) == uma_vez
     assert uma_vez == "transferencia bonificada"
+
+
+# ---------------------------------------------------------------------------
+# SINAL FORTE
+# ---------------------------------------------------------------------------
+
+def test_sinal_forte_com_milheiro_dentro_do_teto():
+    assert mm.sinal_forte(27.0, None) is True
+
+
+def test_sinal_forte_ignora_milheiro_acima_do_teto():
+    assert mm.sinal_forte(45.0, None) is False
+
+
+def test_sinal_forte_com_bonus_alto():
+    assert mm.sinal_forte(None, 70) is True
+
+
+def test_sinal_forte_ignora_bonus_pequeno():
+    assert mm.sinal_forte(None, 40) is False
+
+
+def test_sinal_forte_sem_sinal_nenhum():
+    assert mm.sinal_forte(None, None) is False
+
+
+def test_varrer_alerta_post_de_score_baixo_que_anuncia_milheiro(tmp_path, monkeypatch):
+    """'milheiro por R$ 27' pontua 8, abaixo do corte — mas o fato tem precedência."""
+    monkeypatch.setattr(mm, "STATE_FILE", tmp_path / "estado.json")
+    monkeypatch.setattr(mm, "FEEDS", [("Teste", "https://exemplo.com/feed")])
+    monkeypatch.setattr(mm.time, "sleep", lambda _: None)
+
+    entrada = {
+        "id": "post-1",
+        "title": "Oferta relâmpago: milheiro por R$ 27",
+        "summary": "",
+        "link": "https://exemplo.com/post-1",
+    }
+    feed = types.SimpleNamespace(entries=[entrada], bozo=False)
+    monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
+
+    alertas = mm.varrer()
+
+    assert len(alertas) == 1
+    assert alertas[0].milheiro == 27.0
+    assert alertas[0].score < mm.SCORE_MINIMO
+
+
+def test_varrer_ignora_post_irrelevante(tmp_path, monkeypatch):
+    monkeypatch.setattr(mm, "STATE_FILE", tmp_path / "estado.json")
+    monkeypatch.setattr(mm, "FEEDS", [("Teste", "https://exemplo.com/feed")])
+    monkeypatch.setattr(mm.time, "sleep", lambda _: None)
+
+    entrada = {
+        "id": "post-2",
+        "title": "As 10 melhores praias do Nordeste",
+        "summary": "",
+        "link": "https://exemplo.com/post-2",
+    }
+    feed = types.SimpleNamespace(entries=[entrada], bozo=False)
+    monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
+
+    assert mm.varrer() == []
