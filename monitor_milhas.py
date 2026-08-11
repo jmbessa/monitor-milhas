@@ -404,8 +404,10 @@ def _processar_entrada(fonte: str, entrada: dict, vistos: dict[str, None]) -> Al
     bonus_pct = extrair_bonus(texto)
 
     # Sinal duro fura o corte: o dicionário pode estar incompleto, mas um
-    # milheiro anunciado no título não deixa dúvida.
-    if score < SCORE_MINIMO and not sinal_forte(milheiro, bonus_pct):
+    # milheiro anunciado no título não deixa dúvida. Score negativo é outra
+    # história — aí o dicionário não ficou calado, falou contra o post
+    # ("seguro", "boas-vindas", "celular"), e a palavra dele vale.
+    if score < SCORE_MINIMO and not (score >= 0 and sinal_forte(milheiro, bonus_pct)):
         return None
 
     return Alerta(

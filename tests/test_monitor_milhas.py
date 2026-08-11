@@ -149,12 +149,24 @@ def test_sinal_forte_com_milheiro_dentro_do_teto():
     assert mm.sinal_forte(27.0, None) is True
 
 
+def test_sinal_forte_no_teto_exato():
+    """Fronteira: o teto é inclusivo — R$ 30,00 o milheiro ainda é sinal."""
+    assert mm.MILHEIRO_TETO == 30.0
+    assert mm.sinal_forte(30.0, None) is True
+
+
 def test_sinal_forte_ignora_milheiro_acima_do_teto():
     assert mm.sinal_forte(45.0, None) is False
 
 
 def test_sinal_forte_com_bonus_alto():
     assert mm.sinal_forte(None, 70) is True
+
+
+def test_sinal_forte_no_bonus_exato():
+    """Fronteira: 50% de bônus, o valor de BONUS_FORTE, já é sinal."""
+    assert mm.BONUS_FORTE == 50
+    assert mm.sinal_forte(None, 50) is True
 
 
 def test_sinal_forte_ignora_bonus_pequeno():
@@ -202,6 +214,36 @@ def test_varrer_ignora_post_irrelevante(tmp_path, monkeypatch):
     monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
 
     assert mm.varrer() == []
+
+
+# ---------------------------------------------------------------------------
+# I4 — SCORE NEGATIVO VENCE O SINAL FORTE
+# ---------------------------------------------------------------------------
+
+def test_varrer_descarta_score_negativo_ainda_que_o_preco_seja_legivel(
+    varredura_isolada, monkeypatch
+):
+    """'esfera', 'seguro' e 'celular' existem para matar exatamente isto."""
+    titulo = "Esfera: pontos a R$ 27 por 1.000 no seguro celular"
+    assert mm.extrair_milheiro(titulo) == 27.0     # o preço continua legível
+    assert mm.pontuar(titulo)[0] < 0               # e o dicionário falou contra
+
+    _stub_feed(monkeypatch, [_entrada("post-neg", titulo)])
+    assert mm.varrer() == []
+
+
+def test_varrer_ainda_alerta_score_positivo_com_o_mesmo_preco(
+    varredura_isolada, monkeypatch
+):
+    """O sinal forte segue furando o corte quando o dicionário só ficou curto."""
+    titulo = "Oferta relâmpago: milheiro por R$ 27"
+    _stub_feed(monkeypatch, [_entrada("post-pos", titulo)])
+
+    alertas = mm.varrer()
+
+    assert len(alertas) == 1
+    assert alertas[0].score == 8                   # abaixo de SCORE_MINIMO
+    assert alertas[0].milheiro == 27.0
 
 
 # ---------------------------------------------------------------------------
