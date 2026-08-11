@@ -18,6 +18,16 @@ Variáveis já presentes no ambiente têm precedência sobre o .env.
 Cron sugerido (a cada 20 min, 7h-23h):
     */20 7-23 * * * cd /path && /usr/bin/python3 monitor_milhas.py >> monitor.log 2>&1
 
+Códigos de saída — o workflow depende deles: qualquer valor diferente de zero
+derruba o passo da varredura e impede o commit do estado, para que a execução
+seguinte reencontre os posts como novos e tente outra vez.
+
+    0  fim normal, com ou sem alertas
+    1  credenciais do Telegram ausentes
+    2  algum alerta não foi entregue
+    3  nenhum feed devolveu entradas
+    4  arquivo de estado ilegível
+
 Dependências:
     pip install feedparser requests
 """
@@ -27,7 +37,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -39,6 +51,15 @@ try:
     import requests
 except ImportError:
     sys.exit("Faltam dependências. Rode: pip install feedparser requests")
+
+# Os emojis do alerta quebram no cp1252 do Windows quando a saída vai para um
+# pipe ou arquivo (`>> monitor.log`). Sem isto, `print()` levanta
+# UnicodeEncodeError e derruba a execução.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):  # stdout trocado por objeto sem suporte
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -134,6 +155,26 @@ STATE_FILE = Path(__file__).with_name(".monitor_state.json")
 ENV_FILE = Path(__file__).with_name(".env")
 MAX_STATE_ENTRIES = 2000
 USER_AGENT = "monitor-milhas/1.0 (uso pessoal)"
+TIMEOUT_SOCKET = 20        # segundos — feedparser não expõe timeout próprio
+
+# Um blog que aceita a conexão e nunca responde travaria a varredura até o
+# limite do job (horas), enfileirando as execuções seguintes atrás dela.
+socket.setdefaulttimeout(TIMEOUT_SOCKET)
+
+# Códigos de saída — ver o cabeçalho do módulo.
+SAIDA_OK = 0
+SAIDA_CREDENCIAIS = 1
+SAIDA_ENVIO = 2
+SAIDA_FEEDS = 3
+SAIDA_ESTADO = 4
+
+
+class EstadoCorrompido(RuntimeError):
+    """Estado ilegível: assumir vazio ressuscitaria a janela inteira de posts."""
+
+
+class FeedsIndisponiveis(RuntimeError):
+    """Nenhum feed devolveu entrada — CDN bloqueando o runner, ou rede fora."""
 
 
 def carregar_env() -> None:
@@ -265,25 +306,51 @@ def pontuar(texto: str) -> tuple[int, list[str]]:
 # ----------------------------------------------------------------------------
 
 def carregar_estado() -> dict[str, None]:
-    """IDs já vistos, como conjunto ordenado — dict preserva ordem de inserção."""
+    """IDs já vistos, como conjunto ordenado — dict preserva ordem de inserção.
+
+    Estado ilegível aborta a execução em vez de recomeçar do zero: um arquivo
+    truncado seria lido como "nada visto" e a janela inteira viraria alerta, a
+    enxurrada de dezenas de mensagens que a semeadura existe para evitar.
+    """
     if not STATE_FILE.exists():
         return {}
     try:
         dados = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[warn] estado ilegível ({e}), recomeçando", file=sys.stderr)
-        return {}
+        raise EstadoCorrompido(f"{STATE_FILE.name} ilegível: {e}") from e
+    if not isinstance(dados, list) or not all(isinstance(i, str) for i in dados):
+        raise EstadoCorrompido(f"{STATE_FILE.name} não é uma lista de ids")
     return dict.fromkeys(dados)
 
 
 def salvar_estado(vistos: dict[str, None]) -> None:
+    """Grava o estado de forma atômica: temporário ao lado, depois `os.replace`.
+
+    Escrever por cima truncaria o arquivo antes de escrever — uma interrupção
+    no meio (preempção do runner) deixaria um JSON pela metade.
+    """
     # Corta pelo começo: descarta os mais antigos e preserva os recentes.
     # Só funciona porque `vistos` é dict — com set a ordem seria arbitrária.
     recortado = list(vistos)[-MAX_STATE_ENTRIES:]
+    temporario: Path | None = None
     try:
-        STATE_FILE.write_text(json.dumps(recortado), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=STATE_FILE.parent,
+            prefix=STATE_FILE.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as saida:
+            temporario = Path(saida.name)
+            json.dump(recortado, saida)
+            saida.flush()
+            os.fsync(saida.fileno())
+        os.replace(temporario, STATE_FILE)
     except OSError as e:
         print(f"[erro] não salvou estado: {e}", file=sys.stderr)
+        if temporario is not None:
+            temporario.unlink(missing_ok=True)
 
 
 # ----------------------------------------------------------------------------
@@ -309,7 +376,11 @@ def enviar_telegram(mensagem: str) -> bool:
         r.raise_for_status()
         return True
     except requests.RequestException as e:
-        print(f"[erro] Telegram: {e}", file=sys.stderr)
+        # Só o nome da exceção e o status: o texto do requests traz a URL
+        # inteira, com o token dentro, e o log do Actions é público.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        detalhe = f" (HTTP {status})" if status else ""
+        print(f"[erro] Telegram: {type(e).__name__}{detalhe}", file=sys.stderr)
         return False
 
 
@@ -317,9 +388,41 @@ def enviar_telegram(mensagem: str) -> bool:
 # LOOP PRINCIPAL
 # ----------------------------------------------------------------------------
 
+def _processar_entrada(fonte: str, entrada: dict, vistos: dict[str, None]) -> Alerta | None:
+    """Alerta da entrada, ou None se ela já foi vista ou não interessa."""
+    uid = entrada.get("id") or entrada.get("link")
+    if not uid or uid in vistos:
+        return None
+    vistos[uid] = None
+
+    titulo = entrada.get("title", "").strip()
+    resumo = re.sub(r"<[^>]+>", " ", entrada.get("summary", ""))
+    texto = f"{titulo}\n{resumo}"
+
+    score, termos = pontuar(texto)
+    milheiro = extrair_milheiro(texto)
+    bonus_pct = extrair_bonus(texto)
+
+    # Sinal duro fura o corte: o dicionário pode estar incompleto, mas um
+    # milheiro anunciado no título não deixa dúvida.
+    if score < SCORE_MINIMO and not sinal_forte(milheiro, bonus_pct):
+        return None
+
+    return Alerta(
+        fonte=fonte,
+        titulo=titulo,
+        link=entrada.get("link", ""),
+        score=score,
+        milheiro=milheiro,
+        bonus_pct=bonus_pct,
+        termos=termos,
+    )
+
+
 def varrer() -> list[Alerta]:
     vistos = carregar_estado()
     novos: list[Alerta] = []
+    total_entradas = 0
 
     for fonte, url in FEEDS:
         try:
@@ -328,40 +431,30 @@ def varrer() -> list[Alerta]:
             print(f"[erro] {fonte}: {e}", file=sys.stderr)
             continue
 
-        if getattr(feed, "bozo", False) and not feed.entries:
+        entradas = list(getattr(feed, "entries", None) or [])
+        if not entradas:
             print(f"[warn] {fonte}: feed vazio ou inválido", file=sys.stderr)
             continue
+        total_entradas += len(entradas)
 
-        for entrada in feed.entries[:30]:
-            uid = entrada.get("id") or entrada.get("link")
-            if not uid or uid in vistos:
+        for entrada in entradas[:30]:
+            try:
+                alerta = _processar_entrada(fonte, entrada, vistos)
+            except Exception as e:
+                # Uma entrada torta não pode derrubar a varredura inteira: ela
+                # ficaria no feed por dias, quebrando toda execução.
+                print(f"[warn] {fonte}: entrada ignorada "
+                      f"({type(e).__name__}: {e})", file=sys.stderr)
                 continue
-            vistos[uid] = None
-
-            titulo = entrada.get("title", "").strip()
-            resumo = re.sub(r"<[^>]+>", " ", entrada.get("summary", ""))
-            texto = f"{titulo}\n{resumo}"
-
-            score, termos = pontuar(texto)
-            milheiro = extrair_milheiro(texto)
-            bonus_pct = extrair_bonus(texto)
-
-            # Sinal duro fura o corte: o dicionário pode estar incompleto,
-            # mas um milheiro anunciado no título não deixa dúvida.
-            if score < SCORE_MINIMO and not sinal_forte(milheiro, bonus_pct):
-                continue
-
-            novos.append(Alerta(
-                fonte=fonte,
-                titulo=titulo,
-                link=entrada.get("link", ""),
-                score=score,
-                milheiro=milheiro,
-                bonus_pct=bonus_pct,
-                termos=termos,
-            ))
+            if alerta is not None:
+                novos.append(alerta)
 
         time.sleep(1)  # educado com os servidores
+
+    # Os quatro feeds mudos ao mesmo tempo não é semana fraca, é bloqueio:
+    # sem isto o monitor diria "nada novo" por semanas, sempre verde.
+    if total_entradas == 0:
+        raise FeedsIndisponiveis("nenhum dos feeds devolveu entradas")
 
     salvar_estado(vistos)
     # urgentes primeiro, depois por score
@@ -372,17 +465,43 @@ def varrer() -> list[Alerta]:
 def main() -> int:
     carregar_env()
     agora = datetime.now(timezone.utc).astimezone()
-    alertas = varrer()
+
+    # Antes de varrer: sem credenciais todo envio cairia no ramo dry-run, que
+    # despeja o alerta no log — público, no Actions — devolve False e some com
+    # o negócio, marcando o post como visto. Um secret com o nome errado é o
+    # jeito mais provável de estrear, então tem que ficar vermelho na hora.
+    if not os.environ.get("TELEGRAM_BOT_TOKEN") or not os.environ.get("TELEGRAM_CHAT_ID"):
+        print("[erro] TELEGRAM_BOT_TOKEN e/ou TELEGRAM_CHAT_ID ausentes",
+              file=sys.stderr)
+        return SAIDA_CREDENCIAIS
+
+    try:
+        alertas = varrer()
+    except FeedsIndisponiveis as e:
+        print(f"[erro] {e}", file=sys.stderr)
+        return SAIDA_FEEDS
+    except EstadoCorrompido as e:
+        print(f"[erro] {e}", file=sys.stderr)
+        return SAIDA_ESTADO
 
     if not alertas:
         print(f"[{agora:%d/%m %H:%M}] nada novo")
-        return 0
+        return SAIDA_OK
 
     print(f"[{agora:%d/%m %H:%M}] {len(alertas)} alerta(s)")
+    falhas = 0
     for a in alertas:
-        enviar_telegram(a.formatar())
+        if not enviar_telegram(a.formatar()):
+            falhas += 1
         time.sleep(0.5)  # rate limit do Telegram
-    return 0
+
+    if falhas:
+        # Sai vermelho de propósito: o passo que commita o estado não roda, o
+        # estado desta execução é descartado e a próxima reencontra os posts.
+        print(f"[erro] {falhas} de {len(alertas)} alerta(s) não entregues",
+              file=sys.stderr)
+        return SAIDA_ENVIO
+    return SAIDA_OK
 
 
 if __name__ == "__main__":

@@ -1,9 +1,55 @@
 """Testes de monitor_milhas.py — funções puras e o filtro de varredura."""
 
 import json
+import os
+import socket
+import subprocess
+import sys
 import types
+from pathlib import Path
+
+import pytest
 
 import monitor_milhas as mm
+
+RAIZ = Path(mm.__file__).parent
+
+
+# ---------------------------------------------------------------------------
+# APOIO
+# ---------------------------------------------------------------------------
+
+def _entrada(uid="post-1", titulo="Livelo com 100% de bônus na transferência"):
+    return {
+        "id": uid,
+        "title": titulo,
+        "summary": "",
+        "link": f"https://exemplo.com/{uid}",
+    }
+
+
+def _stub_feed(monkeypatch, entradas):
+    """Todos os FEEDS passam a devolver estas entradas, sem tocar na rede."""
+    feed = types.SimpleNamespace(entries=list(entradas), bozo=False)
+    monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
+
+
+@pytest.fixture
+def varredura_isolada(tmp_path, monkeypatch):
+    """Um feed de mentira e o estado num arquivo descartável."""
+    monkeypatch.setattr(mm, "STATE_FILE", tmp_path / "estado.json")
+    monkeypatch.setattr(mm, "FEEDS", [("Teste", "https://exemplo.com/feed")])
+    monkeypatch.setattr(mm.time, "sleep", lambda _: None)
+    return tmp_path
+
+
+@pytest.fixture
+def main_isolado(varredura_isolada, monkeypatch):
+    """main() sem ler o .env de verdade e com credenciais de brinquedo."""
+    monkeypatch.setattr(mm, "carregar_env", lambda: None)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token-de-teste")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
+    return varredura_isolada
 
 
 # ---------------------------------------------------------------------------
@@ -30,11 +76,39 @@ def test_carregar_estado_ausente_devolve_vazio(tmp_path, monkeypatch):
     assert mm.carregar_estado() == {}
 
 
-def test_carregar_estado_ilegivel_recomeca(tmp_path, monkeypatch):
+def test_carregar_estado_ilegivel_aborta(tmp_path, monkeypatch):
+    """I3: assumir vazio ressuscitaria a janela inteira e viraria enxurrada."""
     arquivo = tmp_path / "estado.json"
     arquivo.write_text("{lixo,", encoding="utf-8")
     monkeypatch.setattr(mm, "STATE_FILE", arquivo)
-    assert mm.carregar_estado() == {}
+    with pytest.raises(mm.EstadoCorrompido):
+        mm.carregar_estado()
+
+
+def test_carregar_estado_com_conteudo_de_outro_tipo_aborta(tmp_path, monkeypatch):
+    """JSON válido mas não uma lista de ids — dict.fromkeys aceitaria calado."""
+    arquivo = tmp_path / "estado.json"
+    arquivo.write_text('{"vistos": 3}', encoding="utf-8")
+    monkeypatch.setattr(mm, "STATE_FILE", arquivo)
+    with pytest.raises(mm.EstadoCorrompido):
+        mm.carregar_estado()
+
+
+def test_salvar_estado_preserva_o_arquivo_quando_a_escrita_falha(tmp_path, monkeypatch):
+    """I3: escrita atômica — o estado anterior sobrevive a uma falha no meio."""
+    arquivo = tmp_path / "estado.json"
+    arquivo.write_text(json.dumps(["id-antigo"]), encoding="utf-8")
+    monkeypatch.setattr(mm, "STATE_FILE", arquivo)
+
+    def _falha_no_meio(dados, saida):
+        saida.write('["id-nov')       # metade do JSON, só no temporário
+        raise OSError("sem espaço em disco")
+
+    monkeypatch.setattr(mm.json, "dump", _falha_no_meio)
+    mm.salvar_estado(dict.fromkeys(["id-novo"]))
+
+    assert json.loads(arquivo.read_text(encoding="utf-8")) == ["id-antigo"]
+    assert list(tmp_path.iterdir()) == [arquivo]   # nenhum temporário largado
 
 
 # ---------------------------------------------------------------------------
@@ -128,3 +202,153 @@ def test_varrer_ignora_post_irrelevante(tmp_path, monkeypatch):
     monkeypatch.setattr(mm.feedparser, "parse", lambda url, agent=None: feed)
 
     assert mm.varrer() == []
+
+
+# ---------------------------------------------------------------------------
+# C1 — ENVIO QUE FALHA TEM QUE FICAR VERMELHO
+# ---------------------------------------------------------------------------
+
+def test_main_falha_quando_o_envio_do_telegram_falha(main_isolado, monkeypatch):
+    """Estado só pode ser commitado se o alerta chegou ao dono."""
+    _stub_feed(monkeypatch, [_entrada()])
+    monkeypatch.setattr(mm, "enviar_telegram", lambda mensagem: False)
+
+    codigo = mm.main()
+
+    assert codigo != 0
+    assert codigo == mm.SAIDA_ENVIO
+
+
+def test_main_devolve_zero_quando_o_envio_da_certo(main_isolado, monkeypatch):
+    enviados = []
+    _stub_feed(monkeypatch, [_entrada()])
+
+    def _envia(mensagem):
+        enviados.append(mensagem)
+        return True
+
+    monkeypatch.setattr(mm, "enviar_telegram", _envia)
+
+    assert mm.main() == 0
+    assert len(enviados) == 1
+
+
+def test_main_falha_sem_credenciais_e_nem_chega_a_varrer(main_isolado, monkeypatch):
+    """Secret com nome errado interpola vazio: nada pode ser consumido."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+
+    def _nao_deveria(*args, **kwargs):
+        raise AssertionError("varreu sem ter para quem alertar")
+
+    monkeypatch.setattr(mm, "varrer", _nao_deveria)
+
+    codigo = mm.main()
+
+    assert codigo != 0
+    assert codigo == mm.SAIDA_CREDENCIAIS
+
+
+# ---------------------------------------------------------------------------
+# C2 — FEEDS MUDOS TÊM QUE FICAR VERMELHOS
+# ---------------------------------------------------------------------------
+
+def test_main_falha_quando_nenhum_feed_devolve_entradas(main_isolado, monkeypatch):
+    _stub_feed(monkeypatch, [])
+    monkeypatch.setattr(mm, "enviar_telegram", lambda mensagem: True)
+
+    codigo = mm.main()
+
+    assert codigo != 0
+    assert codigo == mm.SAIDA_FEEDS
+
+
+def test_varrer_aborta_e_nao_salva_estado_com_todos_os_feeds_vazios(
+    tmp_path, monkeypatch
+):
+    estado = tmp_path / "estado.json"
+    monkeypatch.setattr(mm, "STATE_FILE", estado)
+    monkeypatch.setattr(mm, "FEEDS", [("A", "https://a/feed"), ("B", "https://b/feed")])
+    monkeypatch.setattr(mm.time, "sleep", lambda _: None)
+    _stub_feed(monkeypatch, [])
+
+    with pytest.raises(mm.FeedsIndisponiveis):
+        mm.varrer()
+
+    assert not estado.exists()
+
+
+def test_main_falha_com_estado_corrompido(main_isolado, monkeypatch):
+    (main_isolado / "estado.json").write_text('["a", "b', encoding="utf-8")
+    _stub_feed(monkeypatch, [_entrada()])
+    monkeypatch.setattr(mm, "enviar_telegram", lambda mensagem: True)
+
+    codigo = mm.main()
+
+    assert codigo != 0
+    assert codigo == mm.SAIDA_ESTADO
+
+
+# ---------------------------------------------------------------------------
+# I1 / M2 / M4 / M5 — ROBUSTEZ
+# ---------------------------------------------------------------------------
+
+def test_timeout_de_socket_vale_desde_a_importacao():
+    """I1: feedparser não aceita timeout; um host mudo travaria o job."""
+    assert mm.TIMEOUT_SOCKET == 20
+    assert socket.getdefaulttimeout() == mm.TIMEOUT_SOCKET
+
+
+def test_erro_do_telegram_nao_vaza_o_token(monkeypatch, capsys):
+    """M2: o texto do requests traz a URL inteira, com o token dentro."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:SEGREDO")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+
+    def _estoura(*args, **kwargs):
+        raise mm.requests.HTTPError(
+            "401 Client Error: Unauthorized for url: "
+            "https://api.telegram.org/bot123456:SEGREDO/sendMessage"
+        )
+
+    monkeypatch.setattr(mm.requests, "post", _estoura)
+
+    assert mm.enviar_telegram("oi") is False
+
+    saida = capsys.readouterr()
+    assert "SEGREDO" not in saida.out + saida.err
+    assert "HTTPError" in saida.err
+
+
+class _EntradaTorta:
+    """Entrada que não se comporta como dicionário."""
+
+    def get(self, *args, **kwargs):
+        raise ValueError("entrada sem forma de dicionário")
+
+
+def test_varrer_pula_entrada_malformada_e_segue(varredura_isolada, monkeypatch, capsys):
+    """M5: uma entrada ruim ficaria dias no feed, quebrando toda execução."""
+    _stub_feed(monkeypatch, [_EntradaTorta(), _entrada("post-bom")])
+
+    alertas = mm.varrer()
+
+    assert len(alertas) == 1
+    assert alertas[0].link.endswith("post-bom")
+    assert "entrada ignorada" in capsys.readouterr().err
+
+
+def test_alerta_com_emoji_sobrevive_a_saida_cp1252():
+    """M4: `>> monitor.log` no Windows dá cp1252, e o 🔴 quebraria o print."""
+    codigo = (
+        "import monitor_milhas as mm; "
+        "print(mm.Alerta('Fonte', 'Titulo', 'https://x', 30, milheiro=20.0)"
+        ".formatar())"
+    )
+    ambiente = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+
+    r = subprocess.run(
+        [sys.executable, "-c", codigo],
+        cwd=str(RAIZ), env=ambiente, capture_output=True,
+    )
+
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert "URGENTE" in r.stdout.decode("utf-8", "replace")
