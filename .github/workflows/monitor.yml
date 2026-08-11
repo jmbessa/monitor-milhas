@@ -1,0 +1,46 @@
+name: monitor-milhas
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+# Escopo mínimo: só o necessário para commitar o estado de volta.
+permissions:
+  contents: write
+
+# O cron do GitHub atrasa; sem isto, um run atrasado cairia em cima do
+# próximo e os dois disputariam o push do estado.
+concurrency:
+  group: monitor-milhas
+  cancel-in-progress: false
+
+jobs:
+  varrer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Varrer feeds e alertar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor_milhas.py
+
+      - name: Persistir o estado
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .monitor_state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "estado: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
